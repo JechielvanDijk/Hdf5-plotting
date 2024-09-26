@@ -1,0 +1,9 @@
+#run "pip install -r requirements.txt" in cmd 
+ 
+
+streamlit
+h5py
+numpy
+matplotlib
+pandas
+streamlit-aggrid

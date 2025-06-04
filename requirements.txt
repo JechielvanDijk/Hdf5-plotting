@@ -7,3 +7,6 @@ numpy
 matplotlib
 pandas
 streamlit-aggrid
+
+scipy
+lmfit

@@ -1,151 +1,221 @@
 # app.py
 
-import streamlit as st
+# ===================================================
+# Imports and Configuration
+# ===================================================
+import json
+import logging
+import os
+import shutil
+import tempfile
+from datetime import datetime
+import io
+import re
+
+
 import h5py
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import tempfile
-import os
-import matplotlib.pyplot as plt
-import logging
-
-
-
+import streamlit as st
+import scipy.constants as cs
+from lmfit.models import LinearModel
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
+# ===================================================
+# Session Persistence Functions
+# ===================================================
+SESSIONS_FOLDER = "sessions"
+
+def save_session():
+    """
+    Save the current session state (all non-ephemeral keys) and uploaded files
+    into a new subfolder under the 'sessions' directory.
+    """
+    if not os.path.exists(SESSIONS_FOLDER):
+        os.makedirs(SESSIONS_FOLDER)
+
+    # Use the custom session name if provided, otherwise use the default plot title.
+    custom_name = st.session_state.get("custom_session_name", "").strip()
+    if custom_name:
+        base_name = custom_name
+    else:
+        base_name = st.session_state.get("main_plot_title", "session")
+    
+    dt_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_name = f"{base_name}_{dt_str}"
+    session_dir = os.path.join(SESSIONS_FOLDER, session_name)
+    os.makedirs(session_dir, exist_ok=True)
+
+    # Build a config dictionary by copying every st.session_state key except ephemeral ones.
+    session_config = {}
+    for key, value in st.session_state.items():
+        if key.startswith("remove_"):
+            continue
+        try:
+            json.dumps(value)
+            session_config[key] = value
+        except (TypeError, OverflowError):
+            continue
+
+    # Save the configuration as JSON.
+    config_path = os.path.join(session_dir, "config.json")
+    with open(config_path, "w") as f:
+        json.dump(session_config, f)
+
+    # Copy all uploaded files from temp_files to a 'files' subfolder.
+    files_dir = os.path.join(session_dir, "files")
+    os.makedirs(files_dir, exist_ok=True)
+    if "temp_files" in st.session_state:
+        for file_name, file_path in st.session_state["temp_files"].items():
+            dest_path = os.path.join(files_dir, file_name)
+            shutil.copy(file_path, dest_path)
+
+    st.session_state["current_session_name"] = session_name
+    st.success(f"Session saved as '{session_name}'.")
+
+def load_session(session_name):
+    """
+    Load a session from the specified session folder.
+    This version clears the current st.session_state before restoring the saved configuration,
+    thereby avoiding conflicts with widget-bound keys.
+    """
+    session_dir = os.path.join(SESSIONS_FOLDER, session_name)
+    config_path = os.path.join(session_dir, "config.json")
+    if not os.path.exists(config_path):
+        st.error("Session configuration not found.")
+        return
+
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    # Clear all existing session state.
+    # (This ensures that no widget-bound keys remain.)
+    st.session_state.clear()
+
+    # Define keys that we want to skip (ephemeral widget keys)
+    skip_keys = [
+        "load_session_select",
+        "save_session_button",
+        "load_session_button",
+        "update_session_button",
+        "clear_channels_button",
+        "generate_plot",
+        "add_selected_channels"
+    ]
+
+    # Restore saved keys (skipping any keys that are meant for widgets)
+    for key, value in config.items():
+        if key in skip_keys or key.startswith("remove_") or key.startswith("add_selected_channels"):
+            continue
+        st.session_state[key] = value
+
+    # Re-link uploaded files: update temp_files to point to files in the session folder.
+    files_dir = os.path.join(session_dir, "files")
+    if os.path.exists(files_dir):
+        files = {}
+        for file_name in os.listdir(files_dir):
+            files[file_name] = os.path.join(files_dir, file_name)
+        st.session_state["temp_files"] = files
+        logging.debug(f"Restored uploaded files from {files_dir}")
+
+    st.session_state["current_session_name"] = session_name
+    st.success(f"Session '{session_name}' loaded.")
+
+def update_session(session_name):
+    """
+    Overwrite the saved session (configuration and files) with the current session state.
+    """
+    session_dir = os.path.join(SESSIONS_FOLDER, session_name)
+    if not os.path.exists(session_dir):
+        st.error("Session folder not found.")
+        return
+
+    # Update configuration
+    session_config = {}
+    for key, value in st.session_state.items():
+        try:
+            json.dumps(value)
+            session_config[key] = value
+        except (TypeError, OverflowError):
+            continue
+
+    config_path = os.path.join(session_dir, "config.json")
+    with open(config_path, "w") as f:
+        json.dump(session_config, f)
+    logging.info(f"Session configuration updated at {config_path}")
+
+    # Update files: Only copy if source and destination are different.
+    files_dir = os.path.join(session_dir, "files")
+    os.makedirs(files_dir, exist_ok=True)
+    if "temp_files" in st.session_state:
+        for file_name, file_path in st.session_state["temp_files"].items():
+            dest_path = os.path.join(files_dir, file_name)
+            if os.path.abspath(file_path) == os.path.abspath(dest_path):
+                continue  # Skip if it's already the same file.
+            shutil.copy(file_path, dest_path)
+            logging.debug(f"Updated file {file_name} to {dest_path}")
+
+    st.success(f"Session '{session_name}' updated.")
+
+# ===================================================
+# Utility Helpers
+# ===================================================
+
+def format_numbers(val):
+    if pd.isnull(val):
+        return ''
+    elif isinstance(val, (int, float)):
+        if val == 0:
+            return '0.00'
+        return f"{val:.4g}"
+    else:
+        return val
+
+def decode_if_bytes(x):
+    if isinstance(x, bytes):
+        return x.decode('utf-8')
+    return x
+
+# ===================================================
+# Utility Functions
+# ===================================================
 
 def parse_hdf5_structure(file):
-    """
-    Recursively parses the structure of an HDF5 file.
-
-    Args:
-        file (h5py.File): An open HDF5 file object.
-
-    Returns:
-        dict: A nested dictionary representing the file structure.
-    """
     structure = {}
     logging.debug("Starting to parse HDF5 file structure.")
 
     def visit(name, obj):
         logging.debug(f"Visiting: {name}")
-        path = name.split('/')
-        current = structure
-        for part in path:
+        path_parts = name.split('/')
+        current_dict = structure
+        for part in path_parts:
             if part:
-                current = current.setdefault(part, {})
+                current_dict = current_dict.setdefault(part, {})
         if isinstance(obj, h5py.Dataset):
-            current['_type'] = 'Dataset'
-            current['_shape'] = obj.shape
-            current['_dtype'] = str(obj.dtype)
-            logging.debug(f"Added Dataset: {name}, Shape: {obj.shape}, Dtype: {obj.dtype}")
+            current_dict['_type'] = 'Dataset'
+            current_dict['_shape'] = obj.shape
+            current_dict['_dtype'] = str(obj.dtype)
+            logging.debug(f"Added Dataset: {name} | Shape: {obj.shape} | Dtype: {obj.dtype}")
         elif isinstance(obj, h5py.Group):
-            current['_type'] = 'Group'
+            current_dict['_type'] = 'Group'
             logging.debug(f"Added Group: {name}")
 
     file.visititems(visit)
     logging.debug("Completed parsing HDF5 file structure.")
     return structure
 
-def initialize_session_state():
-    """Initialize session state variables if they don't exist."""
-    if 'selected_dataset' not in st.session_state:
-        st.session_state['selected_dataset'] = None
-    if 'selected_channels' not in st.session_state:
-        st.session_state['selected_channels'] = []
-    if 'temp_files' not in st.session_state:
-        st.session_state['temp_files'] = {}
-
-
-def display_structure(structure, file_name, file_path, parent_path="", indent_level=0):
-    """
-    Recursively displays the HDF5 structure using Streamlit expanders and buttons.
-
-    Args:
-        structure (dict): The HDF5 file structure.
-        file_name (str): Name of the HDF5 file.
-        file_path (str): Path to the temporary HDF5 file.
-        parent_path (str): Current path in the HDF5 hierarchy.
-        indent_level (int): Current indentation level.
-    """
-    logging.debug(f"Displaying structure for file: {file_name}, path: {parent_path}")
-
-    for key, value in structure.items():
-        if key.startswith('_'):
-            logging.debug(f"Skipping metadata key: {key}")
-            continue  # Skip metadata keys
-
-        current_path = f"{parent_path}/{key}" if parent_path else key
-        logging.debug(f"Processing key: {key}, current_path: {current_path}")
-
-        if isinstance(value, dict):
-            if value.get('_type') == 'Dataset':
-                # Display a button for the dataset with indentation
-                button_key = f"{file_name}_{current_path}"
-                logging.debug(f"Creating button for Dataset: {key} with key: {button_key}")
-
-                if indent_level == 0:
-                    # No indentation needed at top level
-                    if st.button(f"{key}", key=button_key):
-                        st.session_state['selected_dataset'] = (file_name, file_path, current_path)
-                        logging.debug(f"Dataset selected: {file_name} - {current_path}")
-                else:
-                    # Calculate indentation width
-                    indentation_width = indent_level * 0.05  # 5% per indent level
-                    if indentation_width > 0.5:
-                        indentation_width = 0.5  # Maximum indentation of 50%
-
-                    remaining_width = 1.0 - indentation_width
-                    if remaining_width <= 0:
-                        remaining_width = 0.1  # Ensure there's space for the button
-
-                    columns = st.columns([indentation_width, remaining_width])
-
-                    with columns[1]:
-                        if st.button(f"{key}", key=button_key):
-                            st.session_state['selected_dataset'] = (file_name, file_path, current_path)
-                            logging.debug(f"Dataset selected: {file_name} - {current_path}")
-            else:
-                # Display an expander for the group with indentation
-                if indent_level == 0:
-                    with st.expander(f"{key}", expanded=False):
-                        display_structure(value, file_name, file_path, current_path, indent_level + 1)
-                else:
-                    # Calculate indentation width
-                    indentation_width = indent_level * 0.05  # 5% per indent level
-                    if indentation_width > 0.5:
-                        indentation_width = 0.5  # Maximum indentation of 50%
-
-                    remaining_width = 1.0 - indentation_width
-                    if remaining_width <= 0:
-                        remaining_width = 0.1  # Ensure there's space for the expander
-
-                    columns = st.columns([indentation_width, remaining_width])
-
-                    with columns[1]:
-                        with st.expander(f"{key}", expanded=False):
-                            display_structure(value, file_name, file_path, current_path, indent_level + 1)
-
-
-
 def load_dataset(file_path, dataset_path):
-    """
-    Loads the dataset from the HDF5 file.
-
-    Args:
-        file_path (str): Path to the HDF5 file.
-        dataset_path (str): Path to the dataset within the HDF5 file.
-
-    Returns:
-        numpy.ndarray: The dataset content.
-    """
-    logging.debug(f"Loading dataset from file: {file_path}, dataset_path: {dataset_path}")
+    logging.debug(f"Loading dataset from file: {file_path} | Dataset path: {dataset_path}")
     try:
         with h5py.File(file_path, 'r') as f:
             dataset = f[dataset_path][()]
-        logging.debug(f"Loaded dataset shape: {dataset.shape}, dtype: {dataset.dtype}")
+        logging.debug(f"Loaded dataset | Shape: {dataset.shape}, Dtype: {dataset.dtype}")
         return dataset
     except KeyError:
         st.error(f"Dataset path '{dataset_path}' not found in the HDF5 file.")
@@ -156,32 +226,17 @@ def load_dataset(file_path, dataset_path):
         logging.exception("Exception occurred while loading dataset.")
         return None
 
-
 def add_selected_channels(selected_channels):
-    """
-    Adds selected channels to the session state.
-
-    Args:
-        selected_channels (list): List of selected channel dictionaries.
-    """
     st.session_state['selected_channels'].extend(selected_channels)
     logging.debug(f"Added channels to session state: {selected_channels}")
 
-
 def remove_selected_channel(index):
-    """
-    Removes a selected channel from the session state.
-
-    Args:
-        index (int): Index of the channel to remove.
-    """
     try:
         channel = st.session_state['selected_channels'].pop(index)
         logging.debug(f"Removed channel from session state: {channel}")
-        # Check if any other channel uses the same file
         file_path = channel['file_path']
-        if not any(ch['file_path'] == file_path for ch in st.session_state['selected_channels']):
-            # Delete the temporary file
+        still_used = any(ch['file_path'] == file_path for ch in st.session_state['selected_channels'])
+        if not still_used:
             try:
                 os.unlink(file_path)
                 file_name = channel['file_name']
@@ -197,11 +252,7 @@ def remove_selected_channel(index):
         st.error("Invalid channel index.")
         logging.error("Attempted to remove a channel with an invalid index.")
 
-
 def clear_selected_channels():
-    """
-    Clears all selected channels and deletes associated temporary files.
-    """
     for channel in st.session_state['selected_channels']:
         file_path = channel['file_path']
         try:
@@ -217,15 +268,230 @@ def clear_selected_channels():
     st.success("All selected channels have been cleared and temporary files deleted.")
     logging.debug("Cleared all selected channels and deleted temporary files.")
 
+def initialize_session_state():
+    if 'selected_dataset' not in st.session_state:
+        st.session_state['selected_dataset'] = None
+    if 'selected_channels' not in st.session_state:
+        st.session_state['selected_channels'] = []
+    if 'temp_files' not in st.session_state:
+        st.session_state['temp_files'] = {}
+    if 'plots_history' not in st.session_state:
+        st.session_state['plots_history'] = {}
+
+# =============================
+# Mobility and Density Calculations
+# =============================
+
+def extract_density(field, rxy, field_cutoffs):
+    if len(field.shape) >= 2:
+        input_is_1d = False
+        original_shape = field.shape[:-1]
+        trace_number = np.prod(original_shape)
+        field = field.reshape((trace_number, -1))
+        rxy = rxy.reshape((trace_number, -1))
+        if len(field_cutoffs) == 2:
+            fc = np.empty(original_shape + (2,))
+            fc[..., 0] = field_cutoffs[0]
+            fc[..., 1] = field_cutoffs[1]
+            field_cutoffs = fc
+        field_cutoffs = field_cutoffs.reshape((trace_number, -1))
+    else:
+        input_is_1d = True
+        trace_number = 1
+        field = np.array((field,))
+        rxy = np.array((rxy,))
+        field_cutoffs = np.array((field_cutoffs,))
+    
+    results = np.empty((2, trace_number))
+    fits = []
+    model = LinearModel()
+    
+    for i in range(trace_number):
+        mask = ~np.isnan(field[i])
+        f = field[i][mask]
+        r = rxy[i][mask]
+        start_field, stop_field = field_cutoffs[i]
+        field_mask = (start_field <= f) & (f <= stop_field)
+        f = f[field_mask]
+        r = r[field_mask]
+        res = model.fit(r, x=f)
+        results[0, i] = 1 / res.best_values["slope"] / cs.e
+        results[1, i] = results[0, i] * (res.params["slope"].stderr / res.best_values["slope"])
+        fits.append(res)
+    
+    if input_is_1d:
+        return (*results[:, 0], fits[0])
+    else:
+        return (*results.reshape((2,) + original_shape), np.reshape(fits, original_shape))
+
+def extract_mobility(field, rxx, ryy, density, geometric_factor):
+    if len(field.shape) >= 2:
+        input_is_1d = False
+        original_shape = field.shape[:-1]
+        trace_number = np.prod(original_shape)
+        field = field.reshape((trace_number, -1))
+        rxx = rxx.reshape((trace_number, -1))
+        ryy = ryy.reshape((trace_number, -1))
+    else:
+        input_is_1d = True
+        trace_number = 1
+        field = np.array((field,))
+        rxx = np.array((rxx,))
+        ryy = np.array((ryy,))
+    
+    r0 = np.empty((2, trace_number))
+    for i in range(trace_number):
+        min_field_ind = np.argmin(np.abs(field[i]))
+        r0[0, i] = rxx[i, min_field_ind]
+        r0[1, i] = ryy[i, min_field_ind]
+    
+    r0 *= geometric_factor
+    mob = 1 / cs.e / density / r0
+    
+    if input_is_1d:
+        return mob[:, 0]
+    else:
+        return mob.reshape((2,) + original_shape)
+
+# ===================================================
+# UI Display Functions
+# ===================================================
+
+def display_plot_history_sidebar():
+    st.sidebar.header("Previously Generated Plots")
+    if not st.session_state.get('plots_history'):
+        st.session_state['plots_history'] = []
+    if st.session_state['plots_history']:
+        for idx, plot_info in enumerate(st.session_state['plots_history']):
+            st.sidebar.write(f"**{idx + 1}. {plot_info['plot_name']}**")
+            st.sidebar.pyplot(plot_info['figure'])
+    else:
+        st.sidebar.write("No plots have been generated yet.")
+
+def display_structure(structure, file_name, file_path, parent_path="", indent_level=0):
+    logging.debug(f"Displaying structure for file: {file_name} | Path: {parent_path}")
+    for key, value in structure.items():
+        if key.startswith('_'):
+            continue
+        current_path = f"{parent_path}/{key}" if parent_path else key
+        if isinstance(value, dict):
+            if value.get('_type') == 'Dataset':
+                button_key = f"{file_name}_{current_path}"
+                if indent_level == 0:
+                    if st.button(f"{key}", key=button_key):
+                        st.session_state['selected_dataset'] = (file_name, file_path, current_path)
+                else:
+                    indentation_width = min(indent_level * 0.05, 0.5)
+                    remaining_width = 1.0 - indentation_width
+                    columns = st.columns([indentation_width, remaining_width])
+                    with columns[1]:
+                        if st.button(f"{key}", key=button_key):
+                            st.session_state['selected_dataset'] = (file_name, file_path, current_path)
+            else:
+                if indent_level == 0:
+                    with st.expander(f"{key}", expanded=False):
+                        display_structure(value, file_name, file_path, current_path, indent_level + 1)
+                else:
+                    indentation_width = min(indent_level * 0.05, 0.5)
+                    remaining_width = 1.0 - indentation_width
+                    columns = st.columns([indentation_width, remaining_width])
+                    with columns[1]:
+                        with st.expander(f"{key}", expanded=False):
+                            display_structure(value, file_name, file_path, current_path, indent_level + 1)
+
+def display_dataset_content(file_name, file_path, dataset_path):
+    data = load_dataset(file_path, dataset_path)
+    if data is None:
+        return
+    st.write(f"### Dataset: `{dataset_path}` in `{file_name}`")
+    if isinstance(data, np.ndarray):
+        if data.dtype.names:
+            df = pd.DataFrame(data).applymap(decode_if_bytes)
+            if dataset_path == "Data/Channel names":
+                st.write("#### Select Channels by Checking the Boxes Below")
+                df = df.reset_index().rename(columns={'index': 'Row Number'})
+                selected_rows = []
+                for i, row in df.iterrows():
+                    base  = row[df.columns[1]]   # channel “name”
+                    extra = row[df.columns[2]]   # channel “info” (Real/Imag)
+                    label = f"{row['Row Number']}: {base}" + (f" ({extra})" if extra else "")
+                    if st.checkbox(label, key=f"select_channel_{i}"):
+                        selected_rows.append(row)
+
+
+                if selected_rows:
+                    if st.button("Add Selected Channels", key="add_selected_channels"):
+                        channel_info = [{
+                            'file_name': file_name,
+                            'channel_name': row[df.columns[1]],
+                            'file_path': file_path,
+                            'data_path': "Data/Data",
+                            'channel_index': row['Row Number']
+                        } for row in selected_rows]
+                        add_selected_channels(channel_info)
+                        st.success(f"Added {len(channel_info)} channels from `{file_name}`.")
+                else:
+                    st.info("Check one or more boxes above to select channels.")
+
+
+
+                st.write("#### Select Channels by Selecting Rows Below")
+                df.reset_index(inplace=True)
+                df.rename(columns={'index': 'Row Number'}, inplace=True)
+                st.dataframe(df)
+                row_numbers = df['Row Number'].tolist()
+                selected_rows = st.multiselect(f"Select Channel Rows from `{file_name}` (by Row Number)",
+                                               options=row_numbers, key="selected_channel_rows")
+                if selected_rows:
+                    selected_channels = df[df['Row Number'].isin(selected_rows)]
+                    channel_info = [{
+                        'file_name': file_name,
+                        'channel_name': row[df.columns[1]],
+                        'file_path': file_path,
+                        'data_path': "Data/Data",
+                        'channel_index': row['Row Number']
+                    } for _, row in selected_channels.iterrows()]
+                    if st.button("Add Selected Channels", key="add_selected_channels"):
+                        add_selected_channels(channel_info)
+                        st.success(f"Added {len(channel_info)} channels from `{file_name}`.")
+                else:
+                    st.info("Select one or more channels from the list above to add to your selection.")
+            else:
+                st.dataframe(df.applymap(format_numbers))
+        else:
+            if data.dtype.kind in {'i', 'f'}:
+                if data.ndim == 3 and data.shape[2] == 1:
+                    data = data.squeeze(axis=2)
+                display_data = data[:100, ...] if data.shape[0] > 100 else data
+                df = pd.DataFrame(display_data)
+                st.dataframe(df.applymap(format_numbers))
+                if data.ndim == 1 or data.shape[1] == 1:
+                    fig, ax = plt.subplots()
+                    ax.plot(data.flatten())
+                    ax.set_title(f"Line Plot of {dataset_path}")
+                    st.pyplot(fig)
+                elif data.ndim == 2:
+                    fig, ax = plt.subplots()
+                    cax = ax.imshow(data, aspect='auto', cmap='viridis')
+                    fig.colorbar(cax)
+                    ax.set_title(f"Heatmap of {dataset_path}")
+                    st.pyplot(fig)
+                else:
+                    st.write("Data format not supported for plotting.")
+            elif data.dtype.kind in {'S', 'U'}:
+                if data.ndim == 0:
+                    st.text(decode_if_bytes(data))
+                else:
+                    st.write([decode_if_bytes(x) for x in data.flatten()])
+            else:
+                st.write("Unsupported data type for preview.")
+    else:
+        st.write("The selected dataset is not a numpy array.")
 
 def display_selected_channels():
-    """
-    Displays the list of selected channels with options to remove individual channels.
-    """
     if not st.session_state['selected_channels']:
         st.info("No channels have been selected yet.")
         return
-
     st.sidebar.header("Selected Channels")
     for idx, channel in enumerate(st.session_state['selected_channels'], start=1):
         col1, col2 = st.sidebar.columns([4, 1])
@@ -234,796 +500,469 @@ def display_selected_channels():
             remove_selected_channel(idx - 1)
             st.experimental_rerun()
 
-
 def display_combined_data():
-    """
-    Displays the combined data of all selected channels from different files,
-    with numbers formatted to display significant digits appropriately.
-    """
     if not st.session_state['selected_channels']:
-        st.info("No channels have been selected yet.")
-        return
 
+        return
     st.write("## Combined Data of Selected Channels")
     data_frames = []
     for channel in st.session_state['selected_channels']:
         try:
-            # Load data
             data = load_dataset(channel['file_path'], channel['data_path'])
-            logging.debug(f"Loaded data for channel: {channel}")
-
             if data is None:
-                continue  # Skip if data failed to load
-
-            # Handle 3D data
+                continue
             if data.ndim == 3 and data.shape[2] == 1:
                 data = data.squeeze(axis=2)
-
-            # Check if data is 1D
             if data.ndim == 1:
                 df_data = pd.DataFrame(data, columns=[f"{channel['file_name']} - {channel['channel_name']}"])
                 data_frames.append(df_data)
-                logging.debug(f"Added 1D data for channel: {channel['channel_name']}")
-                continue  # Move to the next channel
-
-            # Convert to DataFrame
-            df_data = pd.DataFrame(data)
-            logging.debug(f"DataFrame shape before selecting column: {df_data.shape}")
-
-            # Adjust for zero-based indexing
-            column_index = channel['channel_index']
-            if column_index >= df_data.shape[1]:
-                st.error(f"Channel index {column_index} out of bounds for file `{channel['file_name']}`.")
-                logging.error(f"Channel index {column_index} out of bounds for file `{channel['file_name']}`.")
-                continue
-
-            # Select the specific column using iloc to avoid KeyError
-            df_data = df_data.iloc[:, [column_index]]
-            df_data.columns = [f"{channel['file_name']} - {channel['channel_name']}"]
-            data_frames.append(df_data)
-            logging.debug(f"Added 2D data for channel: {channel['channel_name']}")
-
+            else:
+                df_data = pd.DataFrame(data)
+                col_idx = channel['channel_index']
+                if col_idx >= df_data.shape[1]:
+                    st.error(f"Channel index {col_idx} out of bounds for file `{channel['file_name']}`.")
+                    continue
+                df_data = df_data.iloc[:, [col_idx]]
+                df_data.columns = [f"{channel['file_name']} - {channel['channel_name']}"]
+                data_frames.append(df_data)
         except Exception as e:
             st.error(f"Error loading data for channel `{channel['channel_name']}` from `{channel['file_name']}`: {e}")
-            logging.exception("Exception occurred while loading channel data.")
-
     if data_frames:
-        # Determine the maximum length among all data frames
         max_length = max(df.shape[0] for df in data_frames)
-        # Pad shorter data frames with NaN to align data
         padded_data_frames = [df.reindex(range(max_length)) for df in data_frames]
-        # Concatenate data frames horizontally
         combined_data = pd.concat(padded_data_frames, axis=1)
-
-        # Format numbers in the DataFrame
-        def format_numbers(val):
-            if pd.isnull(val):
-                return ''
-            elif val == 0:
-                return '0.00'
-            else:
-                return f"{val:.4g}"
-
-        formatted_combined_data = combined_data.applymap(format_numbers)
-        st.dataframe(formatted_combined_data)
-        logging.debug("Displayed combined data for selected channels with formatted numbers.")
+        st.dataframe(combined_data.applymap(format_numbers))
     else:
         st.error("No data available to display.")
 
-
-
 def plot_selected_channels():
-    """
-    Plots selected channels on the same axes within a single figure.
-    Users can scale, reverse, and customize the plot style for each Y-axis data column.
-    """
-    if not st.session_state['selected_channels']:
+    if not st.session_state.get('selected_channels'):
         st.info("No channels have been selected to plot.")
         return
-
-    st.write("## Plot of Selected Channels")
-
-    # Select X-axis
-    st.write("### Select X-axis Channel")
-    x_axis_options = [
-        f"{idx + 1}. {ch['file_name']} - {ch['channel_name']}"
-        for idx, ch in enumerate(st.session_state['selected_channels'])
-    ]
-    x_axis_choice = st.selectbox("Choose X-axis Channel", options=x_axis_options)
-
-    # Find the selected X-axis channel
+    st.write("## Generate Plot")
+    # Step A: X-Axis Channel
+    x_axis_options = [f"{idx + 1}. {ch['file_name']} - {ch['channel_name']}" 
+                      for idx, ch in enumerate(st.session_state['selected_channels'])]
+    x_axis_choice = st.selectbox("X-Axis Channel", options=x_axis_options, key="x_axis_choice")
     try:
         x_idx = x_axis_options.index(x_axis_choice)
     except ValueError:
-        st.error("Selected X-axis channel is invalid.")
-        logging.error("Selected X-axis channel is invalid.")
+        st.error("Invalid X-axis channel choice.")
         return
-
     x_channel = st.session_state['selected_channels'][x_idx]
-    try:
-        x_data = load_dataset(x_channel['file_path'], x_channel['data_path'])
-        if x_data is None:
-            return  # Skip if data failed to load
+    x_data = load_dataset(x_channel['file_path'], x_channel['data_path'])
+    if x_data is None:
+        return
+    if x_data.ndim == 3 and x_data.shape[2] == 1:
+        x_data = x_data.squeeze(axis=2)
+    if x_data.ndim == 1:
+        x_values = x_data
+    else:
         if x_channel['channel_index'] >= x_data.shape[1]:
-            st.error(
-                f"Channel index {x_channel['channel_index']} out of bounds for file `{x_channel['file_name']}`."
-            )
-            logging.error(
-                f"Channel index {x_channel['channel_index']} out of bounds for file `{x_channel['file_name']}`."
-            )
+            st.error("X-axis channel index out of bounds.")
             return
-        if x_data.ndim == 3 and x_data.shape[2] == 1:
-            x_data = x_data.squeeze(axis=2)
         x_values = x_data[:, x_channel['channel_index']]
-        logging.debug(f"X-axis data shape: {x_values.shape}")
-    except Exception as e:
-        st.error(f"Error loading X-axis data: {e}")
-        logging.exception("Exception occurred while loading X-axis data.")
-        return
-
-    # Select Y-axis channels
-    st.write("### Select Y-axis Channels")
+    # Step B: Y-Axis Channels
     y_axis_options = x_axis_options.copy()
-    y_axis_choices = st.multiselect(
-        "Choose Y-axis Channels", options=y_axis_options, default=[]
-    )
-
+    y_axis_choices = st.multiselect("Y-Axis Channels", options=y_axis_options, key="y_axis_choices")
     if not y_axis_choices:
-        st.info("Select at least one Y-axis channel to plot.")
+        st.info("Select at least one Y-axis channel to proceed.")
         return
-
-    # Assign Y-axis channels to right y-axis (optional)
-    st.write("### Assign Y-axis Channels to Right Axis (Optional)")
-    right_axis_choices = st.multiselect(
-        "Channels for Right Y-Axis", options=y_axis_choices, default=[]
-    )
-    left_axis_choices = [choice for choice in y_axis_choices if choice not in right_axis_choices]
-
+    right_axis_choices = st.multiselect("Channels on Right Axis", options=y_axis_options, key="right_axis_choices")
+    left_axis_choices = [c for c in y_axis_choices if c not in right_axis_choices]
     if not left_axis_choices and not right_axis_choices:
-        st.error(
-            "At least one Y-axis channel must be assigned to either the left or right axis."
-        )
+        st.error("At least one Y-axis channel must remain on the left or right axis.")
         return
-
-    # Collect Y-axis data and allow renaming for each channel
-    y_channels_left = []
-    y_data_list_left = []
-    custom_legend_names_left = []
-    y_channels_right = []
-    y_data_list_right = []
-    custom_legend_names_right = []
-
-    # Legend, plot title, and axis labels
-    st.write("### Legend and Custom Plot Names")
-    with st.expander("Customize Legend and Plot Names", expanded=False):
-        show_legend = st.checkbox("Show Legend", value=True)
-        plot_title = st.text_input("Plot Title", value="Plot of Selected Channels")
-        x_axis_label = st.text_input("X-Axis Label", value="X Values")
-        y_axis_label_left = st.text_input("Left Y-Axis Label", value="Left Y-Axis")
-        y_axis_label_right = st.text_input("Right Y-Axis Label", value="Right Y-Axis (Optional)")
-
-        # Custom names for left Y-axis channels
-        for choice in left_axis_choices:
-            custom_name = st.text_input(
-                f"Custom name for Left Y-axis channel '{choice}'", value=choice
-            )
-            custom_legend_names_left.append(custom_name)
-
-        # Custom names for right Y-axis channels
-        for choice in right_axis_choices:
-            custom_name = st.text_input(
-                f"Custom name for Right Y-axis channel '{choice}'", value=choice
-            )
-            custom_legend_names_right.append(custom_name)
-
-    # Second Legend (Additional text box)
-    with st.expander("Second Legend", expanded=False):
-        additional_legend_text = st.text_area("Enter additional legend text:")
-
-    # Data Transformation Options
-    st.write("### Data Transformation Options")
-    with st.expander("Transform Y-axis Data", expanded=False):
-        scaling_factors = {}
-        reverse_flags = {}
-
-        st.write("#### Left Y-Axis Channels")
-        for idx, choice in enumerate(left_axis_choices):
-            custom_name = custom_legend_names_left[idx]  # Map to custom name
-            scaling_factor = st.number_input(
-                f"Scaling factor for '{custom_name}'",
-                value=1.0,
-                step=0.1,
-                format="%.2f",
-                key=f"scale_left_{idx}",
-            )
-            reverse = st.checkbox(
-                f"Reverse data for '{custom_name}'", value=False, key=f"reverse_left_{idx}"
-            )
-            scaling_factors[choice] = scaling_factor
-            reverse_flags[choice] = reverse
-
-        st.write("#### Right Y-Axis Channels")
-        for idx, choice in enumerate(right_axis_choices):
-            custom_name = custom_legend_names_right[idx]  # Map to custom name
-            scaling_factor = st.number_input(
-                f"Scaling factor for '{custom_name}'",
-                value=1.0,
-                step=0.1,
-                format="%.2f",
-                key=f"scale_right_{idx}",
-            )
-            reverse = st.checkbox(
-                f"Reverse data for '{custom_name}'", value=False, key=f"reverse_right_{idx}"
-            )
-            scaling_factors[choice] = scaling_factor
-            reverse_flags[choice] = reverse
-
-    # Helper function to apply scaling and reversing
-    def transform_data(y, scale=1.0, reverse=False):
-        y = y * scale
-        if reverse:
-            y = np.flip(y)
-        return y
-
-    # Helper function to load y-axis data
-    def load_y_data(choice_list, y_channels, y_data_list, scaling_factors, reverse_flags):
-        for choice in choice_list:
-            try:
-                idx = y_axis_options.index(choice)
-            except ValueError:
-                st.error(f"Selected Y-axis channel `{choice}` is invalid.")
-                logging.error(f"Selected Y-axis channel `{choice}` is invalid.")
-                continue
-
-            channel = st.session_state['selected_channels'][idx]
-            try:
-                data = load_dataset(channel['file_path'], channel['data_path'])
+    # Step C: Legend & Axis Titles (values are stored in st.session_state via keys)
+    with st.expander("Rename Y-Axis Channels", expanded=False):
+        renamed_channels = {}
+        for c in y_axis_choices:
+            idx_c = y_axis_options.index(c)
+            ch_info = st.session_state['selected_channels'][idx_c]
+            original_name = f"{ch_info['file_name']} - {ch_info['channel_name']}"
+            current_renamed = ch_info.get('renamed_name', ch_info['channel_name'])
+            renamed_channels[c] = st.text_input(f"Rename Y-Channel '{original_name}'", value=current_renamed, key=f"rename_{idx_c}")
+        for c, new_name in renamed_channels.items():
+            idx_c = y_axis_options.index(c)
+            st.session_state['selected_channels'][idx_c]['renamed_name'] = new_name
+    with st.expander("Naming (including legends)", expanded=False):
+        show_legend = st.checkbox("Show Legend", value=st.session_state.get("show_legend", False), key="show_legend")
+        main_plot_title = st.text_input("Main Plot Title", value=st.session_state.get("main_plot_title", "My Plot Title"), key="main_plot_title")
+        x_label = st.text_input("X-Axis Label", value=st.session_state.get("x_label", "Temperature (K)"), key="x_label")
+        y_label_left = st.text_input("Left Y-Axis Label", value=st.session_state.get("y_label_left", "Resistance (Ω)"), key="y_label_left")
+        y_label_right = st.text_input("Right Y-Axis Label", value=st.session_state.get("y_label_right", "Resistance (Ω)"), key="y_label_right")
+        calc_mob_den = st.checkbox("Automatically calculate Mobility & Density", key="calc_mob_den_checkbox")
+        computed_legend = ""
+        if calc_mob_den:
+            geo_factor = st.number_input("Geometric Factor", value=st.session_state.get("geo_factor_input", 1.0), format="%.4f", key="geo_factor_input")
+            field_low = st.number_input("Field Cutoff Low", value=st.session_state.get("field_low_input", float(np.min(x_values))), format="%.2f", key="field_low_input")
+            field_high = st.number_input("Field Cutoff High", value=st.session_state.get("field_high_input", float(np.max(x_values))), format="%.2f", key="field_high_input")
+            def get_channel_data(channel_key):
+                idx = y_axis_options.index(channel_key)
+                ch_info = st.session_state['selected_channels'][idx]
+                data = load_dataset(ch_info['file_path'], ch_info['data_path'])
                 if data is None:
-                    continue  # Skip if data failed to load
-
-                # Handle 3D data
+                    return None
                 if data.ndim == 3 and data.shape[2] == 1:
                     data = data.squeeze(axis=2)
-
-                # Check if data is 1D
                 if data.ndim == 1:
-                    y_values = data
+                    return data
                 else:
-                    column_index = channel['channel_index']
-                    if column_index >= data.shape[1]:
-                        st.error(
-                            f"Channel index {column_index} out of bounds for file `{channel['file_name']}`."
-                        )
-                        logging.error(
-                            f"Channel index {column_index} out of bounds for file `{channel['file_name']}`."
-                        )
-                        continue
-                    y_values = data[:, column_index]
-
-                # Apply transformations
-                scale = scaling_factors.get(choice, 1.0)
-                reverse = reverse_flags.get(choice, False)
-                y_values = transform_data(y_values, scale=scale, reverse=reverse)
-
-                y_channels.append(choice)
-                y_data_list.append(y_values)
-                logging.debug(
-                    f"Loaded Y-axis data for channel: {channel['channel_name']} with scale={scale} and reverse={reverse}"
-                )
-
-            except Exception as e:
-                st.error(
-                    f"Error loading Y-axis data for channel `{channel['channel_name']}` from `{channel['file_name']}`: {e}"
-                )
-                logging.exception("Exception occurred while loading Y-axis data.")
-
-    # Load data for left and right Y-axes
-    load_y_data(
-        left_axis_choices,
-        y_channels_left,
-        y_data_list_left,
-        scaling_factors,
-        reverse_flags,
-    )
-    load_y_data(
-        right_axis_choices,
-        y_channels_right,
-        y_data_list_right,
-        scaling_factors,
-        reverse_flags,
-    )
-
-    if not y_data_list_left and not y_data_list_right:
-        st.error("No valid Y-axis channels to plot.")
-        return
-
-    # Plotting Section
-    st.write("### Customize the Plot")
-
-    # Automatically set min and max based on x_values
-    with st.expander("Data Range", expanded=False):
-        st.write("**Specify Data Range (X-Values)**")
-        x_min_default = float(np.min(x_values))
-        x_max_default = float(np.max(x_values))
-        x_min = st.number_input("Minimum X-Value", value=x_min_default, format="%.2f")
-        x_max = st.number_input("Maximum X-Value", value=x_max_default, format="%.2f")
-
-    # Style settings
-    st.write("### Style")
-
-    # Figure Size
-    with st.expander("Figure Size", expanded=False):
-        fig_width = st.number_input(
-            "Figure Width (in inches)",
-            min_value=5.0,
-            max_value=30.0,
-            value=15.0,
-            step=0.5,
-        )
-        fig_height = st.number_input(
-            "Figure Height (in inches)",
-            min_value=5.0,
-            max_value=30.0,
-            value=10.0,
-            step=0.5,
-        )
-
-    # Font Settings
-    with st.expander("Font Settings", expanded=False):
-        title_font_size = st.number_input(
-            "Title Font Size", min_value=8, max_value=32, value=16, step=1
-        )
-        axis_label_font_size = st.number_input(
-            "Axis Label Font Size", min_value=8, max_value=24, value=14, step=1
-        )
-        tick_label_font_size = st.number_input(
-            "Tick Label Font Size", min_value=8, max_value=20, value=12, step=1
-        )
-        bold_title = st.checkbox("Bold Title", value=False)
-        bold_axis_labels = st.checkbox("Bold Axis Labels", value=False)
-
-    # Style options for each plot
-    st.write("**Style Options for Each Plot**")
-    # Initialize dictionaries to store style settings
-    plot_types = {}
-    colors = {}
-    line_styles = {}
-
-    # For left Y-axis channels
-    for idx, choice in enumerate(left_axis_choices):
-        custom_name = custom_legend_names_left[idx]
-        with st.expander(f"Style Options for '{custom_name}'", expanded=False):
-            plot_type = st.selectbox(
-                f"Plot Type for '{custom_name}'",
-                options=['Line Plot', 'Scatter Plot'],
-                index=0,
-                key=f"plot_type_left_{idx}",
-            )
-            plot_types[choice] = plot_type
-
-            color = st.color_picker(
-                f"Color for '{custom_name}' (default is Matplotlib default color cycle)",
-                key=f"color_left_{idx}",
-                value=None,
-            )
-            colors[choice] = color
-
-            line_style = st.selectbox(
-                f"Line Style for '{custom_name}'",
-                options=['Solid', 'Dashed', 'Dotted', 'Dash-dot'],
-                index=0,
-                key=f"line_style_left_{idx}",
-            )
-            line_styles[choice] = line_style
-
-    # For right Y-axis channels
-    for idx, choice in enumerate(right_axis_choices):
-        custom_name = custom_legend_names_right[idx]
-        with st.expander(f"Style Options for '{custom_name}'", expanded=False):
-            plot_type = st.selectbox(
-                f"Plot Type for '{custom_name}'",
-                options=['Line Plot', 'Scatter Plot'],
-                index=0,
-                key=f"plot_type_right_{idx}",
-            )
-            plot_types[choice] = plot_type
-
-            color = st.color_picker(
-                f"Color for '{custom_name}' (default is red to match right Y-axis)",
-                key=f"color_right_{idx}",
-                value='#FF0000',  # Default to red
-            )
-            colors[choice] = color
-
-            line_style = st.selectbox(
-                f"Line Style for '{custom_name}'",
-                options=['Solid', 'Dashed', 'Dotted', 'Dash-dot'],
-                index=0,
-                key=f"line_style_right_{idx}",
-            )
-            line_styles[choice] = line_style
-
-    # Submit button
-    if st.button("Generate Plot"):
-        # Validate data range
-        if x_min >= x_max:
-            st.error("Minimum X-Value must be less than Maximum X-Value.")
-        else:
-            # Filter data based on x-values
-            mask = (x_values >= x_min) & (x_values <= x_max)
-            filtered_x = x_values[mask]
-            if filtered_x.size == 0:
-                st.error("No data points found in the specified X-Value range.")
-                logging.debug(
-                    "No data points found after filtering with the specified X-Value range."
-                )
-                st.stop()
-            filtered_y_left = [y_data[mask] for y_data in y_data_list_left]
-            filtered_y_right = [y_data[mask] for y_data in y_data_list_right]
-
-            # Create plot
-            fig, ax_left = plt.subplots(figsize=(fig_width, fig_height))
-
-            # Get default color cycle
-            default_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-            color_cycle_left = default_colors.copy()
-            color_cycle_right = ['#FF0000']  # Default color for right Y-axis is red
-
-            # Plot left Y-axis data
-            for idx, (y, label) in enumerate(zip(filtered_y_left, custom_legend_names_left)):
-                choice = left_axis_choices[idx]
-                color = colors.get(choice)
-                if not color or color == '#000000':  # If no color specified or black (default color_picker value)
-                    # Use default color cycle
-                    color = color_cycle_left[idx % len(color_cycle_left)]
-                plot_type = plot_types.get(choice, 'Line Plot')
-                line_style = line_styles.get(choice, 'Solid')
-                linestyle_map = {'Solid': '-', 'Dashed': '--', 'Dotted': ':', 'Dash-dot': '-.'}
-                linestyle = linestyle_map.get(line_style, '-')
-
-                if plot_type == 'Scatter Plot':
-                    ax_left.scatter(filtered_x, y, label=label, color=color)
-                else:
-                    ax_left.plot(filtered_x, y, label=label, color=color, linestyle=linestyle)
-
-            # Customize left Y-axis
-            ax_left.set_xlabel(
-                x_axis_label,
-                fontsize=axis_label_font_size,
-                fontweight='bold' if bold_axis_labels else 'normal',
-            )
-            ax_left.set_ylabel(
-                y_axis_label_left,
-                fontsize=axis_label_font_size,
-                fontweight='bold' if bold_axis_labels else 'normal',
-            )
-            ax_left.tick_params(axis='both', which='major', labelsize=tick_label_font_size)
-            ax_left.grid(True)
-
-            # Plot right Y-axis data if any
-            if filtered_y_right:
-                ax_right = ax_left.twinx()
-                ax_right.spines['right'].set_color('red')  # Set the spine color to red
-                for idx, (y, label) in enumerate(zip(filtered_y_right, custom_legend_names_right)):
-                    choice = right_axis_choices[idx]
-                    color = colors.get(choice)
-                    if not color or color == '#000000':  # If no color specified or black (default color_picker value)
-                        # Default to red to match right Y-axis
-                        color = 'red'
-                    plot_type = plot_types.get(choice, 'Line Plot')
-                    line_style = line_styles.get(choice, 'Solid')
-                    linestyle_map = {'Solid': '-', 'Dashed': '--', 'Dotted': ':', 'Dash-dot': '-.'}
-                    linestyle = linestyle_map.get(line_style, '-')
-
-                    if plot_type == 'Scatter Plot':
-                        ax_right.scatter(filtered_x, y, label=label, color=color, marker='x')
+                    if ch_info['channel_index'] < data.shape[1]:
+                        return data[:, ch_info['channel_index']]
                     else:
-                        ax_right.plot(filtered_x, y, label=label, color=color, linestyle=linestyle)
-
-                # Customize right Y-axis
-                ax_right.set_ylabel(
-                    y_axis_label_right,
-                    fontsize=axis_label_font_size,
-                    fontweight='bold' if bold_axis_labels else 'normal',
-                    color='red',  # Set the axis label color to red
-                )
-                ax_right.tick_params(
-                    axis='y', which='major', labelsize=tick_label_font_size, colors='red'
-                )
-                ax_right.spines['right'].set_color('red')  # Set the spine color to red
-
-            # Set plot title
-            ax_left.set_title(
-                plot_title,
-                fontsize=title_font_size,
-                fontweight='bold' if bold_title else 'normal',
-            )
-
-            # Handling legends
-            handles_left, labels_left = ax_left.get_legend_handles_labels()
-            handles_right, labels_right = ([], [])
-            if filtered_y_right:
-                handles_right, labels_right = ax_right.get_legend_handles_labels()
-
-            # Combine legends from both axes
-            if show_legend:
-                # Create main legend
-                combined_handles = handles_left + handles_right
-                combined_labels = labels_left + labels_right
-
-                # If additional legend text is provided, create custom legend entries
-                if additional_legend_text.strip():
-                    # Split additional legend text into lines
-                    legend_lines = additional_legend_text.strip().split('\n')
-                    # Create custom legend entries with empty handles
-                    from matplotlib.lines import Line2D
-                    custom_lines = [Line2D([0], [0], color='none') for _ in legend_lines]
-                    # Append to the combined legend
-                    combined_handles += custom_lines
-                    combined_labels += legend_lines
-
-                # Place the combined legend
-                ax_left.legend(
-                    combined_handles,
-                    combined_labels,
-                    loc='best',
-                    fontsize=12,
-                    frameon=True
-                )
-
-            plt.tight_layout()
-            st.pyplot(fig)
-            logging.debug("Generated plot with left and right Y-axes.")
-
-def display_dataset_content(file_name, file_path, dataset_path):
-    """
-    Displays the content of the selected dataset based on its type.
-    If the selected dataset is "Data/Channel names", provides channel selection functionality.
-    Numbers are formatted to display significant digits appropriately.
-
-    Args:
-        file_name (str): Name of the HDF5 file.
-        file_path (str): Path to the HDF5 file.
-        dataset_path (str): Path to the dataset within the HDF5 file.
-    """
-    try:
-        data = load_dataset(file_path, dataset_path)
-        if data is None:
-            return  # Skip if data failed to load
-
-        st.write(f"### 📄 Dataset: `{dataset_path}` in `{file_name}`")
-        logging.debug(f"Displaying dataset content for: {dataset_path}")
-
-        # Determine the type of data and display accordingly
-        if isinstance(data, np.ndarray):
-            if data.dtype.names:  # Check if the dtype is structured (has field names)
-                logging.debug("Dataset has structured dtype.")
-                # Convert structured array to pandas DataFrame
-                df = pd.DataFrame(data)
-                logging.debug(f"DataFrame created with shape: {df.shape}")
-
-                # Decode byte strings in object columns
-                for col in df.select_dtypes(include=['object']).columns:
-                    logging.debug(f"Decoding byte strings in column: {col}")
-                    df[col] = df[col].apply(lambda x: x.decode('utf-8') if isinstance(x, bytes) else x)
-
-                # Check if the selected dataset is "Data/Channel names"
-                if dataset_path == "Data/Channel names":
-                    st.write("#### Select Channels by Selecting Rows in the Table Below")
-                    logging.debug("Providing channel selection by row number.")
-
-                    # Add a row number column
-                    df.reset_index(inplace=True)
-                    df.rename(columns={'index': 'Row Number'}, inplace=True)
-                    logging.debug("Added 'Row Number' column to DataFrame.")
-
-                    # Display the DataFrame with row numbers
-                    st.dataframe(df)
-
-                    # Provide a multiselect widget for row numbers
-                    row_numbers = df['Row Number'].tolist()
-                    selected_rows = st.multiselect(
-                        f"Select Channel Rows from `{file_name}` (by Row Number)",
-                        options=row_numbers,
-                        default=[]
-                    )
-                    logging.debug(f"Selected row numbers: {selected_rows}")
-
-                    if selected_rows:
-                        # Extract selected channel names based on row numbers
-                        selected_channels = df[df['Row Number'].isin(selected_rows)]
-                        channel_info = [
-                            {
-                                'file_name': file_name,
-                                'channel_name': row[df.columns[1]],  # Assuming channel names are in the second column
-                                'file_path': file_path,
-                                'data_path': "Data/Data",  # Adjust if necessary
-                                'channel_index': row['Row Number']  # Zero-based indexing
-                            }
-                            for idx, row in selected_channels.iterrows()
-                        ]
-                        logging.debug(f"Selected channels: {channel_info}")
-
-                        # Add selected channels to session state
-                        if st.button("Add Selected Channels"):
-                            add_selected_channels(channel_info)
-                            st.success(f"Added {len(channel_info)} channels from `{file_name}`.")
-                            logging.debug(f"Added channels to session state: {channel_info}")
-                    else:
-                        st.info("Select one or more channels from the list above to add to your selection.")
-                        logging.debug("No channels selected.")
-                else:
-                    # For other structured datasets, format numbers and display the DataFrame
-                    def format_numbers(val):
-                        if pd.isnull(val):
-                            return ''
-                        elif isinstance(val, (int, float)):
-                            if val == 0:
-                                return '0.00'
-                            else:
-                                return f"{val:.4g}"
-                        else:
-                            return val  # Non-numeric values remain unchanged
-
-                    formatted_df = df.applymap(format_numbers)
-                    st.dataframe(formatted_df)
-                    logging.debug("Displayed structured dataset as DataFrame with formatted numbers.")
+                        return None
+            if left_axis_choices:
+                rxy_channel = left_axis_choices[0]
+                rxy_data = get_channel_data(rxy_channel)
             else:
-                # Handle other data types as before
-                logging.debug("Dataset does not have structured dtype.")
-                if data.dtype.kind in {'i', 'f'}:
-                    logging.info("Dataset is numerical.")
-                    # Handle 3D numerical data by squeezing if necessary
-                    if data.ndim == 3 and data.shape[2] == 1:
-                        logging.debug("Squeezing last dimension of 3D numerical data.")
-                        data = data.squeeze(axis=2)
-                        logging.debug(f"New data shape after squeeze: {data.shape}")
+                rxy_data = None
+            if left_axis_choices:
+                rxx_channel = left_axis_choices[0]
+                ryy_channel = left_axis_choices[0] if len(left_axis_choices)==1 else left_axis_choices[1]
+            else:
+                rxx_channel = ryy_channel = None
+            if rxy_data is not None and rxx_channel is not None:
+                try:
+                    density_val, density_err, _ = extract_density(x_values, rxy_data, (field_low, field_high))
+                    rxx_data = get_channel_data(rxx_channel)
+                    ryy_data = get_channel_data(ryy_channel)
+                    mob_vals = extract_mobility(x_values, rxx_data, ryy_data, density_val, geo_factor)
+                    mu_xx_cm = mob_vals[0] * 1e4
+                    mu_yy_cm = mob_vals[1] * 1e4
+                    density_cm = density_val * 1e-4
+                    density_err_cm = density_err * 1e-4
+                    mob_text = f"Mobility: μxx = {mu_xx_cm:.3g} cm²/Vs, μyy = {mu_yy_cm:.3g} cm²/Vs"
+                    dens_text = f"Carrier Density: n = {density_cm:.3g} cm⁻² (± {density_err_cm:.3g})"
+                    computed_legend = mob_text + "\n" + dens_text
+                except Exception as e:
+                    computed_legend = f"Error in Mobility/Density calculation: {e}"
+            else:
+                computed_legend = "Insufficient channel data for Mobility/Density calculation."
+            if st.button("Update Legend Text", key="update_legend_text"):
+                st.session_state['extra_legend_text'] = computed_legend
+        if 'extra_legend_text' not in st.session_state:
+            st.session_state['extra_legend_text'] = ""
+        extra_legend_text = st.text_area("Additional Legend Info", value=st.session_state.get('extra_legend_text', ""), key="extra_legend_text_area")
+    st.write("### Step D: Plot Settings")
+    x_nonnan = x_values[~np.isnan(x_values)]
+    if x_nonnan.size == 0:
+        st.error("All X-values are NaN; cannot specify data range.")
+        return
+    with st.expander("Data range", expanded=False):
+        x_min_default = float(np.min(x_nonnan))
+        x_max_default = float(np.max(x_nonnan))
+        user_x_min = st.number_input("X-Min", value=st.session_state.get("plot_xmin", x_min_default), format="%.2f", key="plot_xmin")
+        user_x_max = st.number_input("X-Max", value=st.session_state.get("plot_xmax", x_max_default), format="%.2f", key="plot_xmax")
+        if user_x_min >= user_x_max:
+            st.error("X-Min must be less than X-Max.")
+            return
+    with st.expander("Figure size and Font settings", expanded=False):
+        fig_width = st.number_input("Figure Width", 5.0, 30.0, st.session_state.get("fig_width", 12.0), 0.5, key="fig_width")
+        fig_height = st.number_input("Figure Height", 4.0, 30.0, st.session_state.get("fig_height", 6.0), 0.5, key="fig_height")
+        title_font_size = st.number_input("Title Font Size", 8, 32, st.session_state.get("title_font_size", 16), 1, key="title_font_size")
+        axis_label_font_size = st.number_input("Axis Label Font Size", 8, 24, st.session_state.get("axis_label_font_size", 14), 1, key="axis_label_font_size")
+        tick_label_font_size = st.number_input("Tick Label Font Size", 8, 20, st.session_state.get("tick_label_font_size", 12), 1, key="tick_label_font_size")
+        bold_title = st.checkbox("Bold Title", value=st.session_state.get("bold_title", False), key="bold_title")
+        bold_axis_labels = st.checkbox("Bold Axis Labels", value=st.session_state.get("bold_axis_labels", False), key="bold_axis_labels")
+    st.write("### Step E: Cut Data (Per Channel)")
+    def get_channel_valid_x_count(ch_key):
+        idx_c = y_axis_options.index(ch_key)
+        ch_info = st.session_state['selected_channels'][idx_c]
+        data_ = load_dataset(ch_info['file_path'], ch_info['data_path'])
+        if data_ is None:
+            return 0
+        if data_.ndim == 3 and data_.shape[2] == 1:
+            data_ = data_.squeeze(axis=2)
+        if data_.ndim == 1:
+            y_vals = data_
+        else:
+            if ch_info['channel_index'] >= data_.shape[1]:
+                return 0
+            y_vals = data_[:, ch_info['channel_index']]
+        final_mask = (~np.isnan(x_values)) & (~np.isnan(y_vals)) & ((x_values >= user_x_min) & (x_values <= user_x_max))
+        return np.count_nonzero(final_mask)
+    cut_map = {}
+    all_channels = left_axis_choices + right_axis_choices
+    for c in all_channels:
+        idx_c = y_axis_options.index(c)
+        ch_info = st.session_state['selected_channels'][idx_c]
+        label_for_expander = ch_info.get('renamed_name', f"{ch_info['file_name']} - {ch_info['channel_name']}")
+        valid_count = get_channel_valid_x_count(c)
+        with st.expander(f"Cut Data for: {label_for_expander}", expanded=False):
+            st.write(f"Number of valid X-values (non-NaN, after range filtering): {valid_count}")
+            c_start = st.number_input("Start index to cut out", min_value=0, value=st.session_state.get(f"cut_start_idx_{c}", 0), step=1, key=f"cut_start_idx_{c}")
+            c_end = st.number_input("End index to cut out (inclusive)", min_value=0, value=st.session_state.get(f"cut_end_idx_{c}", 0), step=1, key=f"cut_end_idx_{c}")
+            cut_map[c] = (c_start, c_end)
+    st.write("### Step F: Transformations & Scale per Channel")
+    def reflect_x_local(xx, yy):
+        if xx.size > 0:
+            x_mid = 0.5 * (np.min(xx) + np.max(xx))
+            x_ref = 2.0 * x_mid - xx
+            sort_idx = np.argsort(x_ref)
+            return x_ref[sort_idx], yy[sort_idx]
+        return xx, yy
+    def reflect_y_local(yy):
+        if yy.size > 0:
+            y_mid = 0.5 * (np.min(yy) + np.max(yy))
+            return 2.0 * y_mid - yy
+        return yy
+    def apply_transformations(x_arr, y_arr, flip_x, flip_y, reflect_x, reflect_y, scale):
+        x_local = x_arr.copy()
+        y_local = y_arr.copy()
+        if flip_x:
+            y_local = -y_local
+        if flip_y:
+            x_local = -x_local
+        if reflect_x:
+            x_local, y_local = reflect_x_local(x_local, y_local)
+        if reflect_y:
+            y_local = reflect_y_local(y_local)
+        y_local *= scale
+        return x_local, y_local
+    transforms_map = {}
+    for c in all_channels:
+        idx_c = y_axis_options.index(c)
+        ch_info = st.session_state['selected_channels'][idx_c]
+        label_for_expander = ch_info.get('renamed_name', f"{ch_info['file_name']} - {ch_info['channel_name']}")
+        with st.expander(f"Transform: {label_for_expander}", expanded=False):
+            flip_x_c = st.checkbox("Flip X-axis (Invert Y)", value=st.session_state.get(f"flipx_{c}", False), key=f"flipx_{c}")
+            flip_y_c = st.checkbox("Flip Y-axis (Invert X)", value=st.session_state.get(f"flipy_{c}", False), key=f"flipy_{c}")
+            reflect_x_c = st.checkbox("Reflect X about midpoint", value=st.session_state.get(f"reflx_{c}", False), key=f"reflx_{c}")
+            reflect_y_c = st.checkbox("Reflect Y about midpoint", value=st.session_state.get(f"refly_{c}", False), key=f"refly_{c}")
+            scale_factor_c = st.number_input("Scale Factor (Y)", min_value=0.0, value=st.session_state.get(f"scale_{c}", 1.0), step=0.1, format="%.2f", key=f"scale_{c}")
+            transforms_map[c] = {
+                "flip_x": flip_x_c,
+                "flip_y": flip_y_c,
+                "reflect_x": reflect_x_c,
+                "reflect_y": reflect_y_c,
+                "scale": scale_factor_c
+            }
+    st.write("### Step G: Y-Axis Channel Style")
+    default_left_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+    styles_map = {}
+    left_color_index = 0
+    for c in all_channels:
+        idx_c = y_axis_options.index(c)
+        ch_info = st.session_state['selected_channels'][idx_c]
+        label_for_style = ch_info.get('renamed_name', f"{ch_info['file_name']} - {ch_info['channel_name']}")
+        default_color = default_left_colors[left_color_index % len(default_left_colors)] if c in left_axis_choices else "#FF0000"
+        if c in left_axis_choices:
+            left_color_index += 1
+        with st.expander(f"Style: {label_for_style}", expanded=False):
+            line_style = st.selectbox("Line Style", options=["-", "--", "-.", ":"], key=f"linestyle_{c}")
+            marker_style = st.selectbox("Marker", options=["None", "o", "x", "s", "d", "^"], key=f"marker_{c}")
+            picked_color = st.color_picker("Color", value=st.session_state.get(f"color_{c}", default_color), key=f"color_{c}")
+            styles_map[c] = {"linestyle": line_style, "marker": "" if marker_style=="None" else marker_style, "color": picked_color}
+    if st.button("Generate Plot", key="generate_plot"):
+        mask_nan = ~np.isnan(x_values)
+        mask_range = (x_values >= user_x_min) & (x_values <= user_x_max)
+        combined_mask = mask_nan & mask_range
+        if not np.any(combined_mask):
+            st.error("No data points found in the specified X range.")
+            return
+        fig, ax_left = plt.subplots(figsize=(fig_width, fig_height))
+        def cut_data_by_indices(xx, yy, channel_key):
+            n_points = xx.size
+            if n_points == 0:
+                return xx, yy
+            c_start, c_end = cut_map.get(channel_key, (0, 0))
+            c_start = min(max(c_start, 0), n_points - 1)
+            c_end = min(max(c_end, 0), n_points - 1)
+            if c_start <= c_end:
+                xx = np.concatenate([xx[:c_start], xx[c_end+1:]])
+                yy = np.concatenate([yy[:c_start], yy[c_end+1:]])
+            return xx, yy
+        for c in left_axis_choices:
+            idx_c = y_axis_options.index(c)
+            ch_info = st.session_state['selected_channels'][idx_c]
+            loaded_data = load_dataset(ch_info['file_path'], ch_info['data_path'])
+            if loaded_data is None:
+                continue
+            if loaded_data.ndim == 3 and loaded_data.shape[2] == 1:
+                loaded_data = loaded_data.squeeze(axis=2)
+            y_vals = loaded_data if loaded_data.ndim == 1 else loaded_data[:, ch_info['channel_index']]
+            tr = transforms_map[c]
+            x_loc, y_loc = apply_transformations(x_values, y_vals, flip_x=tr["flip_x"],
+                                                 flip_y=tr["flip_y"], reflect_x=tr["reflect_x"],
+                                                 reflect_y=tr["reflect_y"], scale=tr["scale"])
+            final_mask = combined_mask & ~np.isnan(y_loc)
+            xx, yy = x_loc[final_mask], y_loc[final_mask]
+            xx, yy = cut_data_by_indices(xx, yy, c)
+            if xx.size == 0:
+                st.error("No data remain after index cutting.")
+                return
+            style_info = styles_map.get(c, {})
+            ax_left.plot(xx, yy, label=ch_info.get('renamed_name', c), linestyle=style_info.get('linestyle', '-'),
+                         marker=style_info.get('marker', ''), color=style_info.get('color', '#1f77b4'))
+        ax_left.set_xlabel(x_label, fontsize=axis_label_font_size, fontweight='bold' if bold_axis_labels else 'normal')
+        ax_left.set_ylabel(y_label_left, fontsize=axis_label_font_size, fontweight='bold' if bold_axis_labels else 'normal')
+        ax_left.tick_params(axis='both', labelsize=tick_label_font_size)
+        ax_left.grid(True)
+        if right_axis_choices:
+            ax_right = ax_left.twinx()
+            first_right = right_axis_choices[0]
+            right_axis_color = styles_map.get(first_right, {}).get('color', 'red')
+            ax_right.spines['right'].set_color(right_axis_color)
+            ax_right.tick_params(axis='y', labelsize=tick_label_font_size, colors=right_axis_color)
+            for c in right_axis_choices:
+                idx_c = y_axis_options.index(c)
+                ch_info = st.session_state['selected_channels'][idx_c]
+                loaded_data = load_dataset(ch_info['file_path'], ch_info['data_path'])
+                if loaded_data is None:
+                    continue
+                if loaded_data.ndim == 3 and loaded_data.shape[2] == 1:
+                    loaded_data = loaded_data.squeeze(axis=2)
+                y_vals = loaded_data if loaded_data.ndim == 1 else loaded_data[:, ch_info['channel_index']]
+                tr = transforms_map[c]
+                x_loc, y_loc = apply_transformations(x_values, y_vals, flip_x=tr["flip_x"],
+                                                     flip_y=tr["flip_y"], reflect_x=tr["reflect_x"],
+                                                     reflect_y=tr["reflect_y"], scale=tr["scale"])
+                final_mask = combined_mask & ~np.isnan(y_loc)
+                xx, yy = x_loc[final_mask], y_loc[final_mask]
+                xx, yy = cut_data_by_indices(xx, yy, c)
+                if xx.size == 0:
+                    st.error("No data remain after index cutting.")
+                    return
+                style_info = styles_map.get(c, {})
+                ax_right.plot(xx, yy, label=ch_info.get('renamed_name', c), linestyle=style_info.get('linestyle', '-'),
+                              marker=style_info.get('marker', ''), color=style_info.get('color', 'red'))
+            ax_right.set_ylabel(y_label_right, fontsize=axis_label_font_size,
+                                fontweight='bold' if bold_axis_labels else 'normal', color=right_axis_color)
+        ax_left.set_title(main_plot_title, fontsize=title_font_size, fontweight='bold' if bold_title else 'normal')
+        if show_legend:
+            handles_left, labels_left = ax_left.get_legend_handles_labels()
+            handles_right, labels_right = (ax_right.get_legend_handles_labels() if right_axis_choices else ([], []))
+            combined_handles = handles_left + handles_right
+            combined_labels = labels_left + labels_right
+            if extra_legend_text.strip():
+                from matplotlib.lines import Line2D
+                lines_extra = extra_legend_text.strip().split('\n')
+                placeholders = [Line2D([0], [0], color='none') for _ in lines_extra]
+                combined_handles += placeholders
+                combined_labels += lines_extra
+            ax_left.legend(combined_handles, combined_labels, loc='best', fontsize=12, frameon=True)
+        plt.tight_layout()
+        st.pyplot(fig)
+            # ——— New: download button ———
+     # ——— Updated: transparent download & filename from title ———
+        # 1. grab the title (empty string if none)
+        ax = fig.axes[0] if fig.axes else None
+        title = ax.get_title() if ax else ""
+        # 2. make a safe filename (letters, numbers, -, _ only)
+        safe = re.sub(r'[^A-Za-z0-9_\-]', '_', title).strip('_') or "plot"
+        filename = f"{safe}.png"
+        # 3. render into a transparent buffer
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", transparent=True)
+        buf.seek(0)
+        st.download_button(
+            label="Download Plot as PNG",
+            data=buf,
+            file_name=filename,
+            mime="image/png"
+        )
 
-                    if data.ndim <= 2:
-                        max_rows = 100  # Limit for performance
-                        if data.shape[0] > max_rows:
-                            st.write(f"Displaying first {max_rows} rows:")
-                            display_data = data[:max_rows, ...]
-                        else:
-                            display_data = data
+        def make_unique_plot_name(base_name):
+            existing_names = [p["plot_name"] for p in st.session_state.get('plots_history', [])]
+            if base_name not in existing_names:
+                return base_name
+            i = 2
+            new_name = f"{base_name} ({i})"
+            while new_name in existing_names:
+                i += 1
+                new_name = f"{base_name} ({i})"
+            return new_name
+        final_plot_name = make_unique_plot_name(main_plot_title)
+        if "plots_history" not in st.session_state:
+            st.session_state["plots_history"] = []
+        st.session_state['plots_history'].insert(0, {"plot_name": final_plot_name, "figure": fig})
+        st.success(f"Plot '{final_plot_name}' generated and stored in sidebar history!")
 
-                        # Convert to DataFrame for formatting
-                        df = pd.DataFrame(display_data)
-                        def format_numbers(val):
-                            if pd.isnull(val):
-                                return ''
-                            elif val == 0:
-                                return '0.00'
-                            else:
-                                return f"{val:.4g}"
-                        formatted_df = df.applymap(format_numbers)
-                        st.dataframe(formatted_df)
-                        logging.debug(f"Displayed numerical data with shape: {display_data.shape}")
-
-                        # Provide a line chart if 1D or a heatmap if 2D
-                        if data.ndim == 1 or data.shape[1] == 1:
-                            fig, ax = plt.subplots()
-                            ax.plot(data.flatten())
-                            ax.set_title(f"Line Plot of {dataset_path}")
-                            st.pyplot(fig)
-                            logging.debug(f"Plotted 1D data for {dataset_path}.")
-                        elif data.ndim == 2:
-                            fig, ax = plt.subplots()
-                            cax = ax.imshow(data, aspect='auto', cmap='viridis')
-                            fig.colorbar(cax)
-                            ax.set_title(f"Heatmap of {dataset_path}")
-                            st.pyplot(fig)
-                            logging.debug(f"Plotted 2D data as heatmap for {dataset_path}.")
-                    else:
-                        st.write("Data format not supported for plotting.")
-                        logging.warning("Unsupported data format for numerical data.")
-                elif data.dtype.kind in {'S', 'U'}:
-                    logging.info("Dataset contains strings.")
-                    # Handle byte strings or Unicode strings
-                    # Convert to regular strings if necessary
-                    if data.ndim == 0:
-                        # Scalar string
-                        decoded_str = data.decode('utf-8') if isinstance(data, bytes) else data
-                        st.text(decoded_str)
-                        logging.debug("Displayed scalar string.")
-                    else:
-                        # Array of strings
-                        decoded_str = [x.decode('utf-8') if isinstance(x, bytes) else x for x in data.flatten()]
-                        st.write(decoded_str)
-                        logging.debug("Displayed array of strings.")
-                else:
-                    st.write("Unsupported data type for preview.")
-                    logging.warning("Unsupported data type encountered.")
-    except Exception as e:
-        st.error(f"An error occurred while displaying the dataset: {e}")
-        logging.exception("Exception occurred in display_dataset_content.")
-
+# ===================================================
+# Main Function
+# ===================================================
 
 def main():
     initialize_session_state()
-
     st.set_page_config(page_title="🗂️ HDF5 Structure Dashboard", layout="wide")
-
-    # Title
+    
+    # Display the plot history in the sidebar
+    display_plot_history_sidebar()
+    
     st.title("🗂️ HDF5 Files Structure Dashboard")
-
-    # Add vertical spacing between title and upload section
     st.markdown("<br><br>", unsafe_allow_html=True)
-
+    
+    # Sidebar file upload section
     st.sidebar.header("Upload HDF5 Files")
-    uploaded_files = st.sidebar.file_uploader(
-        "Choose HDF5 files", type=["h5", "hdf5"], accept_multiple_files=True
-    )
-
+    uploaded_files = st.sidebar.file_uploader("Choose HDF5 files", type=["h5", "hdf5"], accept_multiple_files=True)
     if uploaded_files:
         for uploaded_file in uploaded_files:
             with st.expander(f"📄 {uploaded_file.name}", expanded=False):
                 try:
-                    # Save the uploaded file to a temporary location for h5py to read
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".hdf5") as tmp:
                         tmp.write(uploaded_file.read())
                         tmp_path = tmp.name
                         st.session_state['temp_files'][uploaded_file.name] = tmp_path
                         logging.debug(f"Uploaded file saved temporarily at: {tmp_path}")
-
                     with h5py.File(tmp_path, 'r') as f:
-                        # Read the 'comment' attribute
                         comment = f.attrs.get('comment', 'No comment available.')
-
-                        # Display the comment
                         st.markdown("**File Notes:**")
-                        st.markdown(
-                            f"<div style='height:200px; overflow:auto; border:1px solid #ccc; padding:10px;'>{comment}</div>",
-                            unsafe_allow_html=True
-                        )
-
-                        # Proceed to parse and display the file structure
+                        st.markdown(f"""<div style='height:200px; overflow:auto; border:1px solid #ccc; padding:10px;'>{comment}</div>""", unsafe_allow_html=True)
                         structure = parse_hdf5_structure(f)
-
-                        # Display only the "Data" group
                         if 'Data' in structure:
                             data_structure = structure['Data']
                             display_structure(data_structure, uploaded_file.name, tmp_path, parent_path="Data", indent_level=0)
-                            logging.debug(f"Structure displayed for 'Data' group in file: {uploaded_file.name}")
                         else:
                             st.warning("The uploaded HDF5 file does not contain a 'Data' group.")
-                            logging.warning(f"'Data' group not found in file: {uploaded_file.name}")
-
-                except OSError as e:
+                except OSError:
                     st.error(f"Could not open {uploaded_file.name}. It might be corrupted or not a valid HDF5 file.")
-                    logging.error(f"Could not open {uploaded_file.name}: {e}")
                 except Exception as e:
                     st.error(f"An unexpected error occurred while reading {uploaded_file.name}: {e}")
-                    logging.exception(f"Unexpected error with file {uploaded_file.name}.")
-
-    # Handle dataset selection from session state
-    if st.session_state['selected_dataset']:
+    
+    # Display the selected dataset in the sidebar, if any
+    if st.session_state.get('selected_dataset'):
         file_name, file_path, dataset_path = st.session_state['selected_dataset']
         st.sidebar.header("View Selected Dataset")
         st.sidebar.write(f"**File:** {file_name}")
         st.sidebar.write(f"**Dataset Path:** {dataset_path}")
-
         try:
-            # Display the dataset content
             display_dataset_content(file_name, file_path, dataset_path)
-            logging.debug(f"Displayed content for dataset: {dataset_path} in file: {file_name}")
         except Exception as e:
             st.error(f"Error processing selected dataset: {e}")
-            logging.exception("Exception occurred while processing selected dataset.")
-
-    # Display selected channels and provide options to remove them
+    
     display_selected_channels()
-
-    # Display combined data from selected channels
     display_combined_data()
-
-    # Plotting Section
     plot_selected_channels()
-
-    # Option to clear all selected channels
-    if st.sidebar.button("Clear All Selected Channels"):
+    
+    if st.sidebar.button("Clear All Selected Channels", key="clear_channels_button"):
         clear_selected_channels()
+    
+    # Session Management at the bottom of the screen
+    with st.container():
+        st.markdown("---")
+        st.header("Session Management")
+        # New text input for the custom session name.
+        st.text_input("Custom Session Name (optional)", key="custom_session_name")
+        
+        if st.button("Save Session", key="save_session_bottom"):
+            save_session()
+        if not os.path.exists(SESSIONS_FOLDER):
+            os.makedirs(SESSIONS_FOLDER)
+        session_list = os.listdir(SESSIONS_FOLDER)
+        selected_session = st.selectbox("Load Session", [""] + session_list, key="load_session_select_bottom")
+        if st.button("Load Selected Session", key="load_session_button_bottom"):
+            if selected_session:
+                load_session(selected_session)
+            else:
+                st.warning("Select a session to load.")
+        if st.button("Update Current Session", key="update_session_button_bottom"):
+            if st.session_state.get("current_session_name"):
+                update_session(st.session_state["current_session_name"])
+            else:
+                st.warning("No current session to update. Save a session first.")
 
 
 if __name__ == "__main__":
     main()
+
